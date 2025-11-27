@@ -1,22 +1,27 @@
-package org.dfpl.dbp.rtree;
+package org.dfpl.dbp.rtree.team1;
 
 import java.util.Iterator;
 import java.util.List;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedList;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.PriorityQueue;
 
 import java.awt.Color;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
+import java.awt.BasicStroke;
+import java.awt.Font;
 import javax.swing.JFrame;
 import javax.swing.JPanel;
 import javax.swing.SwingUtilities;
 import javax.swing.JOptionPane;
 
-// RTreeImpl 클래스. RTree 인터페이스를 구현하고 GUI 및 모든 로직을 포함.
+/**
+ * RTree 구현 클래스.
+ * R-Tree의 핵심 로직(삽입, 검색, 삭제)과 Java Swing을 이용한 시각화 기능을 포함함.
+ */
 public class RTreeImpl implements RTree {
 
     private static final int MAX_ENTRIES = 4;
@@ -27,12 +32,36 @@ public class RTreeImpl implements RTree {
 
     private JFrame guiFrame;
     private RTreePanel guiPanel;
-    private volatile Rectangle currentSearchRect;
-    private volatile Point currentKnnSource;
-    private volatile List<Point> highlightedPoints = Collections.synchronizedList(new ArrayList<>());
+
+    private Rectangle currentSearchRect;
+    private Point currentKnnSource;
+    private List<Point> highlightedPoints = new ArrayList<>();
     private boolean firstDeleteCall = true;
 
-    // Node 내부 클래스. 트리의 노드(가지 또는 나뭇잎)를 정의.
+    private Point lastInsertedPoint;
+    private Rectangle lastExpandedMbr;
+    private Node splitGroup1;
+    private Node splitGroup2;
+    private List<Node> prunedNodes = new ArrayList<>();
+
+    private List<Node> knnVisitedNodes = new ArrayList<>();
+    private Map<Node, Integer> knnVisitOrder = new HashMap<>();
+    private Node knnCurrentNode;
+    private double knnCurrentBestDist = Double.POSITIVE_INFINITY;
+    private List<Point> knnCandidatePoints = new ArrayList<>();
+    private Map<Point, Double> knnResultDistances = new HashMap<>();
+    private Point knnNewlyFoundPoint;
+
+    private Point deletingPoint;
+    private Node deletingLeafNode;
+    private Rectangle oldMbrBeforeDelete;
+    private Rectangle shrinkingMbr;
+    private List<Node> underflowNodes = new ArrayList<>();
+
+    /**
+     * R-Tree의 노드 클래스.
+     * 사각형(MBR) 정보와 자식 노드 또는 포인트 리스트를 관리함.
+     */
     class Node {
         Rectangle mbr;
         boolean leaf;
@@ -40,6 +69,10 @@ public class RTreeImpl implements RTree {
         List<Point> points;
         Node parent;
 
+        /**
+         * Node 생성자.
+         * 리프 노드 여부와 부모 노드를 받아 노드를 초기화함.
+         */
         public Node(boolean leaf, Node parent) {
             this.leaf = leaf;
             this.parent = parent;
@@ -53,6 +86,10 @@ public class RTreeImpl implements RTree {
             }
         }
 
+        /**
+         * MBR 반환 메서드.
+         * 현재 노드의 MBR을 반환하며, 초기화되지 않았을 경우 무효한 MBR을 반환함.
+         */
         public Rectangle getMbr() {
             if (!hasValidMbr()) {
                 return createInvalidMbr();
@@ -60,6 +97,10 @@ public class RTreeImpl implements RTree {
             return this.mbr;
         }
 
+        /**
+         * 엔트리 MBR 반환 메서드.
+         * 포인트나 자식 노드 객체를 받아 해당 객체의 MBR을 반환함.
+         */
         public Rectangle getEntryMbr(Object entry) {
             if (entry instanceof Point) {
                 Point p = (Point) entry;
@@ -70,10 +111,18 @@ public class RTreeImpl implements RTree {
             return createInvalidMbr();
         }
 
+        /**
+         * MBR 유효성 확인 메서드.
+         * 현재 MBR이 유효한 값을 가지고 있는지 확인함.
+         */
         public boolean hasValidMbr() {
             return mbr.getLeftTop().getX() != Double.POSITIVE_INFINITY;
         }
 
+        /**
+         * MBR 재계산 메서드.
+         * 노드가 포함하고 있는 자식들이나 포인트들을 기반으로 MBR을 다시 계산하여 갱신함.
+         */
         public void recalcMbr() {
             if (leaf) {
                 if (points.isEmpty()) {
@@ -121,15 +170,22 @@ public class RTreeImpl implements RTree {
         }
     }
 
-    // RTreePanel 내부 클래스. Swing의 JPanel을 상속받아 R-Tree를 화면에 그림.
+    /**
+     * 시각화 패널 클래스.
+     * R-Tree의 상태와 알고리즘 동작 과정을 그래픽으로 그림.
+     */
     class RTreePanel extends JPanel {
-        private final int PADDING = 50;
-        private final Color[] LEVEL_COLORS = {
-                Color.RED, Color.ORANGE, Color.YELLOW, Color.GREEN, Color.BLUE, Color.MAGENTA
-        };
+        private final int PADDING = 60;
+        private final Color COLOR_ROOT = new Color(148, 0, 211);
+        private final Color COLOR_INTERNAL = new Color(0, 0, 255);
+        private final Color COLOR_LEAF = new Color(0, 128, 0);
         private double dataMaxX = 200;
         private double dataMaxY = 200;
 
+        /**
+         * 컴포넌트 그리기 메서드.
+         * 그래픽 객체를 받아 배경, 격자, 트리 노드, 시각화 효과 등을 순서대로 그림.
+         */
         @Override
         protected void paintComponent(Graphics g) {
             super.paintComponent(g);
@@ -143,78 +199,511 @@ public class RTreeImpl implements RTree {
             double scale = Math.min(scaleX, scaleY);
             int yOffset = panelHeight - PADDING;
 
+            drawGrid(g2d, scale, yOffset, panelWidth, panelHeight);
+
             if (root != null) {
-                drawNode(g2d, root, 0, scale, yOffset);
+                drawDepthMBR(g2d, root, 0, scale, yOffset);
+            }
+
+            if (splitGroup1 != null && splitGroup1.hasValidMbr()) {
+                drawSplitOverlay(g2d, splitGroup1, new Color(0, 180, 255, 70), scale, yOffset, "Group 1");
+            }
+            if (splitGroup2 != null && splitGroup2.hasValidMbr()) {
+                drawSplitOverlay(g2d, splitGroup2, new Color(255, 120, 200, 70), scale, yOffset, "Group 2");
             }
 
             if (currentSearchRect != null) {
-                g2d.setColor(new Color(0, 0, 255, 50));
-                int x = (int) (currentSearchRect.getLeftTop().getX() * scale) + PADDING;
-                int y = yOffset - (int) (currentSearchRect.getRightBottom().getY() * scale);
-                int w = (int) ((currentSearchRect.getRightBottom().getX() - currentSearchRect.getLeftTop().getX())
-                        * scale);
-                int h = (int) ((currentSearchRect.getRightBottom().getY() - currentSearchRect.getLeftTop().getY())
-                        * scale);
-                g2d.fillRect(x, y, w, h);
-                g2d.setColor(Color.BLUE);
-                g2d.drawRect(x, y, w, h);
+                drawPrunedNodes(g2d, scale, yOffset);
+                drawSearchArea(g2d, scale, yOffset);
             }
 
-            if (currentKnnSource != null) {
-                g2d.setColor(Color.RED);
-                int x = (int) (currentKnnSource.getX() * scale) + PADDING - 4;
-                int y = yOffset - (int) (currentKnnSource.getY() * scale) - 4;
-                g2d.fillOval(x, y, 8, 8);
+            drawKNNVisualization(g2d, scale, yOffset);
+
+            if (deletingLeafNode != null) {
+                drawDeletingLeaf(g2d, scale, yOffset);
             }
 
-            g2d.setColor(Color.CYAN);
-            List<Point> pointsToHighlight = new ArrayList<>(highlightedPoints);
-            for (Point p : pointsToHighlight) {
-                int x = (int) (p.getX() * scale) + PADDING - 5;
-                int y = yOffset - (int) (p.getY() * scale) - 5;
-                g2d.fillOval(x, y, 10, 10);
+            if (oldMbrBeforeDelete != null && shrinkingMbr != null) {
+                drawShrinkAnimation(g2d, scale, yOffset);
+            }
+
+            if (lastExpandedMbr != null && splitGroup1 == null && splitGroup2 == null) {
+                drawExpandedMBR(g2d, scale, yOffset);
+            }
+
+            if (root != null) {
+                drawAllPoints(g2d, root, scale, yOffset);
+            }
+
+            drawHighlightedPoints(g2d, scale, yOffset);
+
+            if (lastInsertedPoint != null) {
+                drawNewPoint(g2d, scale, yOffset);
+            }
+
+            if (deletingPoint != null) {
+                drawDeletingPoint(g2d, scale, yOffset);
             }
         }
 
-        private void drawNode(Graphics2D g, Node node, int level, double scale, int yOffset) {
-            if (node == null || !node.hasValidMbr())
-                return;
+        /**
+         * 배경 격자 그리기 메서드.
+         * 좌표계의 눈금과 축을 그림.
+         */
+        private void drawGrid(Graphics2D g, double scale, int yOffset, int panelWidth, int panelHeight) {
+            g.setColor(new Color(220, 220, 220));
+            g.setStroke(new BasicStroke(1));
 
-            Rectangle mbr = node.mbr;
+            for (int i = 0; i <= 200; i += 20) {
+                int x = (int) (i * scale) + PADDING;
+                g.drawLine(x, PADDING, x, yOffset);
+                g.setColor(Color.DARK_GRAY);
+                g.drawString(String.valueOf(i), x - 8, yOffset + 15);
+                g.setColor(new Color(220, 220, 220));
+            }
+
+            for (int i = 0; i <= 200; i += 20) {
+                int y = yOffset - (int) (i * scale);
+                g.drawLine(PADDING, y, panelWidth - PADDING, y);
+                g.setColor(Color.DARK_GRAY);
+                g.drawString(String.valueOf(i), PADDING - 25, y + 4);
+                g.setColor(new Color(220, 220, 220));
+            }
+
+            g.setColor(Color.BLACK);
+            g.setStroke(new BasicStroke(2));
+            g.drawLine(PADDING, yOffset, panelWidth - PADDING, yOffset);
+            g.drawLine(PADDING, PADDING, PADDING, yOffset);
+            g.setStroke(new BasicStroke(1));
+        }
+
+        /**
+         * MBR 그리기 메서드.
+         * 트리의 깊이에 따라 다른 색상으로 노드의 MBR을 재귀적으로 그림.
+         */
+        private void drawDepthMBR(Graphics2D g, Node node, int depth, double scale, int yOffset) {
+            if (node == null || !node.hasValidMbr()) return;
+
+            Rectangle mbr = node.getMbr();
             int x = (int) (mbr.getLeftTop().getX() * scale) + PADDING;
             int y = yOffset - (int) (mbr.getRightBottom().getY() * scale);
             int w = (int) ((mbr.getRightBottom().getX() - mbr.getLeftTop().getX()) * scale);
             int h = (int) ((mbr.getRightBottom().getY() - mbr.getLeftTop().getY()) * scale);
-            Color c = LEVEL_COLORS[level % LEVEL_COLORS.length];
 
-            if (currentSearchRect != null && rectIntersects(node.getMbr(), currentSearchRect)) {
-                g.setColor(new Color(c.getRed(), c.getGreen(), c.getBlue(), 100));
-            } else if (currentSearchRect != null) {
-                g.setColor(new Color(200, 200, 200, 30));
+            if (node == root) {
+                g.setColor(new Color(148, 0, 211, 20));
+                g.fillRect(x, y, w, h);
+                g.setColor(new Color(148, 0, 211, 100));
+                g.setStroke(new BasicStroke(1.5f));
+                g.drawRect(x, y, w, h);
+                g.setStroke(new BasicStroke(1));
+            } else if (node.leaf) {
+                g.setColor(new Color(0, 180, 0, 25));
+                g.fillRect(x, y, w, h);
+                g.setColor(new Color(0, 150, 0, 120));
+                g.setStroke(new BasicStroke(1.0f));
+                g.drawRect(x, y, w, h);
+                g.setStroke(new BasicStroke(1));
             } else {
-                g.setColor(new Color(c.getRed(), c.getGreen(), c.getBlue(), 50));
+                g.setColor(new Color(0, 120, 255, 20));
+                g.fillRect(x, y, w, h);
+                g.setColor(new Color(0, 100, 255, 100));
+                g.setStroke(new BasicStroke(1.0f));
+                g.drawRect(x, y, w, h);
+                g.setStroke(new BasicStroke(1));
             }
 
-            g.fillRect(x, y, w, h);
-            g.setColor(c);
-            g.drawRect(x, y, w, h);
-
-            if (node.leaf) {
-                g.setColor(Color.BLACK);
-                for (Point p : node.points) {
-                    int px = (int) (p.getX() * scale) + PADDING - 2;
-                    int py = yOffset - (int) (p.getY() * scale) - 2;
-                    g.fillOval(px, py, 4, 4);
-                }
-            } else {
+            if (!node.leaf && node.children != null) {
                 for (Node child : node.children) {
-                    drawNode(g, child, level + 1, scale, yOffset);
+                    drawDepthMBR(g, child, depth + 1, scale, yOffset);
                 }
             }
         }
+
+        /**
+         * 분할 시각화 메서드.
+         * 노드 분할 시 두 그룹을 서로 다른 색상으로 강조하여 그림.
+         */
+        private void drawSplitOverlay(Graphics2D g, Node node, Color color, double scale, int yOffset, String label) {
+            Rectangle mbr = node.getMbr();
+            int x = (int) (mbr.getLeftTop().getX() * scale) + PADDING;
+            int y = yOffset - (int) (mbr.getRightBottom().getY() * scale);
+            int w = (int) ((mbr.getRightBottom().getX() - mbr.getLeftTop().getX()) * scale);
+            int h = (int) ((mbr.getRightBottom().getY() - mbr.getLeftTop().getY()) * scale);
+
+            g.setColor(color);
+            g.fillRect(x, y, w, h);
+            g.setColor(new Color(color.getRed(), color.getGreen(), color.getBlue(), 200));
+            g.setStroke(new BasicStroke(2));
+            g.drawRect(x, y, w, h);
+            g.setStroke(new BasicStroke(1));
+
+            g.setColor(Color.BLACK);
+            g.setFont(new Font("SansSerif", Font.BOLD, 12));
+            g.drawString(label, x + w/2 - 20, y + h/2);
+        }
+
+        /**
+         * 검색 영역 그리기 메서드.
+         * 사용자가 요청한 범위 검색 사각형을 그림.
+         */
+        private void drawSearchArea(Graphics2D g, double scale, int yOffset) {
+            int x = (int) (currentSearchRect.getLeftTop().getX() * scale) + PADDING;
+            int y = yOffset - (int) (currentSearchRect.getRightBottom().getY() * scale);
+            int w = (int) ((currentSearchRect.getRightBottom().getX() - currentSearchRect.getLeftTop().getX()) * scale);
+            int h = (int) ((currentSearchRect.getRightBottom().getY() - currentSearchRect.getLeftTop().getY()) * scale);
+
+            g.setColor(new Color(100, 150, 255, 50));
+            g.fillRect(x, y, w, h);
+            g.setColor(new Color(0, 100, 255));
+            g.setStroke(new BasicStroke(2));
+            g.drawRect(x, y, w, h);
+            g.setStroke(new BasicStroke(1));
+        }
+
+        /**
+         * 가지치기 노드 시각화 메서드.
+         * 검색 과정에서 제외된(pruned) 노드들을 회색 빗금으로 표시함.
+         */
+        private void drawPrunedNodes(Graphics2D g, double scale, int yOffset) {
+            g.setFont(new Font("SansSerif", Font.BOLD, 10));
+            for (Node pruned : new ArrayList<>(prunedNodes)) {
+                if (!pruned.hasValidMbr()) continue;
+
+                Rectangle mbr = pruned.getMbr();
+                int x = (int) (mbr.getLeftTop().getX() * scale) + PADDING;
+                int y = yOffset - (int) (mbr.getRightBottom().getY() * scale);
+                int w = (int) ((mbr.getRightBottom().getX() - mbr.getLeftTop().getX()) * scale);
+                int h = (int) ((mbr.getRightBottom().getY() - mbr.getLeftTop().getY()) * scale);
+
+                g.setColor(new Color(150, 150, 150, 80));
+                g.fillRect(x, y, w, h);
+
+                g.setColor(new Color(100, 100, 100, 150));
+                g.setStroke(new BasicStroke(1));
+                for (int i = 0; i < w + h; i += 10) {
+                    int x1 = x + Math.min(i, w);
+                    int y1 = y + Math.max(0, i - w);
+                    int x2 = x + Math.max(0, i - h);
+                    int y2 = y + Math.min(i, h);
+                    g.drawLine(x1, y1, x2, y2);
+                }
+
+                g.setColor(new Color(200, 0, 0));
+                g.setStroke(new BasicStroke(3));
+                g.drawLine(x + 5, y + 5, x + w - 5, y + h - 5);
+                g.drawLine(x + w - 5, y + 5, x + 5, y + h - 5);
+                g.setStroke(new BasicStroke(1));
+
+                g.setColor(Color.RED);
+                g.drawString("PRUNED", x + w/2 - 25, y + h/2);
+
+                drawPrunedPoints(g, pruned, scale, yOffset);
+            }
+        }
+
+        /**
+         * 삭제 대상 리프 시각화 메서드.
+         * 삭제될 포인트가 포함된 리프 노드를 강조하여 그림.
+         */
+        private void drawDeletingLeaf(Graphics2D g, double scale, int yOffset) {
+            if (deletingLeafNode == null || !deletingLeafNode.hasValidMbr()) return;
+
+            Rectangle mbr = deletingLeafNode.getMbr();
+            int x = (int) (mbr.getLeftTop().getX() * scale) + PADDING;
+            int y = yOffset - (int) (mbr.getRightBottom().getY() * scale);
+            int w = (int) ((mbr.getRightBottom().getX() - mbr.getLeftTop().getX()) * scale);
+            int h = (int) ((mbr.getRightBottom().getY() - mbr.getLeftTop().getY()) * scale);
+
+            g.setColor(new Color(255, 200, 0, 100));
+            g.fillRect(x, y, w, h);
+            g.setColor(new Color(255, 200, 0));
+            g.setStroke(new BasicStroke(3));
+            g.drawRect(x, y, w, h);
+            g.setStroke(new BasicStroke(1));
+        }
+
+        /**
+         * KNN 시각화 메서드.
+         * 탐색 반경, 방문 노드, 후보 점, 연결선 등을 그림.
+         */
+        private void drawKNNVisualization(Graphics2D g, double scale, int yOffset) {
+            if (currentKnnSource == null) return;
+
+            int qx = (int) (currentKnnSource.getX() * scale) + PADDING;
+            int qy = yOffset - (int) (currentKnnSource.getY() * scale);
+
+            if (knnCurrentBestDist < Double.POSITIVE_INFINITY && knnCurrentBestDist > 0) {
+                int radius = (int) (knnCurrentBestDist * scale);
+
+                g.setColor(new Color(0, 100, 255, 10));
+                g.fillOval(qx - radius, qy - radius, 2 * radius, 2 * radius);
+
+                g.setColor(new Color(0, 50, 200));
+                g.setStroke(new BasicStroke(1.5f, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10, new float[]{10, 5}, 0));
+                g.drawOval(qx - radius, qy - radius, 2 * radius, 2 * radius);
+                g.setStroke(new BasicStroke(1));
+
+                g.setFont(new Font("SansSerif", Font.BOLD, 11));
+                g.drawString(String.format("Dist: %.1f", knnCurrentBestDist), qx + radius + 5, qy);
+            }
+
+            g.setFont(new Font("SansSerif", Font.BOLD, 10));
+            for (Node pruned : new ArrayList<>(prunedNodes)) {
+                if (!pruned.hasValidMbr()) continue;
+                Rectangle mbr = pruned.getMbr();
+                int x = (int) (mbr.getLeftTop().getX() * scale) + PADDING;
+                int y = yOffset - (int) (mbr.getRightBottom().getY() * scale);
+                int w = (int) ((mbr.getRightBottom().getX() - mbr.getLeftTop().getX()) * scale);
+                int h = (int) ((mbr.getRightBottom().getY() - mbr.getLeftTop().getY()) * scale);
+
+                g.setColor(new Color(100, 100, 100, 50));
+                g.fillRect(x, y, w, h);
+                g.setColor(new Color(200, 0, 0));
+                g.drawLine(x, y, x + w, y + h);
+                g.drawLine(x + w, y, x, y + h);
+                g.drawString("PRUNED", x + w/2 - 20, y + h/2);
+
+                drawPrunedPoints(g, pruned, scale, yOffset);
+            }
+
+            g.setFont(new Font("SansSerif", Font.BOLD, 12));
+            for (Node visited : new ArrayList<>(knnVisitedNodes)) {
+                if (!visited.hasValidMbr() || visited == knnCurrentNode) continue;
+
+                Rectangle mbr = visited.getMbr();
+                int x = (int) (mbr.getLeftTop().getX() * scale) + PADDING;
+                int y = yOffset - (int) (mbr.getRightBottom().getY() * scale);
+                int w = (int) ((mbr.getRightBottom().getX() - mbr.getLeftTop().getX()) * scale);
+                int h = (int) ((mbr.getRightBottom().getY() - mbr.getLeftTop().getY()) * scale);
+
+                g.setColor(new Color(255, 140, 0, 180));
+                g.setStroke(new BasicStroke(2));
+                g.drawRect(x, y, w, h);
+                g.setStroke(new BasicStroke(1));
+
+                Integer order = knnVisitOrder.get(visited);
+                if (order != null) {
+                    g.setColor(new Color(255, 69, 0));
+                    g.drawString("#" + order, x + 5, y + 15);
+                }
+            }
+
+            if (knnCurrentNode != null && knnCurrentNode.hasValidMbr()) {
+                Rectangle mbr = knnCurrentNode.getMbr();
+                int x = (int) (mbr.getLeftTop().getX() * scale) + PADDING;
+                int y = yOffset - (int) (mbr.getRightBottom().getY() * scale);
+                int w = (int) ((mbr.getRightBottom().getX() - mbr.getLeftTop().getX()) * scale);
+                int h = (int) ((mbr.getRightBottom().getY() - mbr.getLeftTop().getY()) * scale);
+
+                g.setColor(new Color(255, 100, 0, 40));
+                g.fillRect(x, y, w, h);
+
+                g.setColor(new Color(255, 0, 0));
+                g.setStroke(new BasicStroke(3));
+                g.drawRect(x, y, w, h);
+                g.setStroke(new BasicStroke(1));
+
+                g.setColor(Color.RED);
+                g.drawString("VISITING", x + 5, y - 5);
+            }
+
+            for (Point candidate : new ArrayList<>(knnCandidatePoints)) {
+                int px = (int) (candidate.getX() * scale) + PADDING;
+                int py = yOffset - (int) (candidate.getY() * scale);
+                g.setColor(new Color(0, 180, 0));
+                g.fillOval(px - 4, py - 4, 8, 8);
+            }
+
+            if (knnNewlyFoundPoint != null) {
+                int px = (int) (knnNewlyFoundPoint.getX() * scale) + PADDING;
+                int py = yOffset - (int) (knnNewlyFoundPoint.getY() * scale);
+
+                g.setColor(Color.RED);
+                g.setStroke(new BasicStroke(2));
+                g.drawLine(qx, qy, px, py);
+                g.setStroke(new BasicStroke(1));
+
+                double dist = currentKnnSource.distance(knnNewlyFoundPoint);
+                g.setFont(new Font("SansSerif", Font.BOLD, 11));
+                g.setColor(Color.RED);
+                g.drawString(String.format("%.2f", dist), (qx + px) / 2 + 5, (qy + py) / 2 - 5);
+            }
+
+            g.setColor(Color.RED);
+            g.fillOval(qx - 6, qy - 6, 12, 12);
+            g.setColor(Color.WHITE);
+            g.setFont(new Font("SansSerif", Font.BOLD, 10));
+            g.drawString("S", qx - 3, qy + 4);
+        }
+
+        /**
+         * 가지치기 점 시각화 메서드.
+         * 탐색에서 제외된 노드 내부의 점들을 회색으로 표시함.
+         */
+        private void drawPrunedPoints(Graphics2D g, Node node, double scale, int yOffset) {
+            if (node.leaf && node.points != null) {
+                for (Point p : node.points) {
+                    int px = (int) (p.getX() * scale) + PADDING;
+                    int py = yOffset - (int) (p.getY() * scale);
+
+                    g.setColor(new Color(120, 120, 120));
+                    g.fillOval(px - 4, py - 4, 8, 8);
+                    g.setColor(new Color(80, 80, 80));
+                    g.setStroke(new BasicStroke(2));
+                    g.drawLine(px - 3, py - 3, px + 3, py + 3);
+                    g.drawLine(px - 3, py + 3, px + 3, py - 3);
+                    g.setStroke(new BasicStroke(1));
+                }
+            } else if (!node.leaf && node.children != null) {
+                for (Node child : node.children) {
+                    drawPrunedPoints(g, child, scale, yOffset);
+                }
+            }
+        }
+
+        /**
+         * 축소 애니메이션 시각화 메서드.
+         * 삭제 시 MBR이 줄어드는 과정을 이전 MBR과 새 MBR로 표시함.
+         */
+        private void drawShrinkAnimation(Graphics2D g, double scale, int yOffset) {
+            int x1 = (int) (oldMbrBeforeDelete.getLeftTop().getX() * scale) + PADDING;
+            int y1 = yOffset - (int) (oldMbrBeforeDelete.getRightBottom().getY() * scale);
+            int w1 = (int) ((oldMbrBeforeDelete.getRightBottom().getX() - oldMbrBeforeDelete.getLeftTop().getX()) * scale);
+            int h1 = (int) ((oldMbrBeforeDelete.getRightBottom().getY() - oldMbrBeforeDelete.getLeftTop().getY()) * scale);
+            g.setColor(new Color(255, 100, 100, 150));
+            g.setStroke(new BasicStroke(2, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10, new float[]{5}, 0));
+            g.drawRect(x1, y1, w1, h1);
+
+            int x2 = (int) (shrinkingMbr.getLeftTop().getX() * scale) + PADDING;
+            int y2 = yOffset - (int) (shrinkingMbr.getRightBottom().getY() * scale);
+            int w2 = (int) ((shrinkingMbr.getRightBottom().getX() - shrinkingMbr.getLeftTop().getX()) * scale);
+            int h2 = (int) ((shrinkingMbr.getRightBottom().getY() - shrinkingMbr.getLeftTop().getY()) * scale);
+            g.setColor(new Color(0, 200, 0));
+            g.setStroke(new BasicStroke(2));
+            g.drawRect(x2, y2, w2, h2);
+            g.setStroke(new BasicStroke(1));
+        }
+
+        /**
+         * 확장된 MBR 시각화 메서드.
+         * 삽입 시 늘어난 MBR 영역을 강조하여 그림.
+         */
+        private void drawExpandedMBR(Graphics2D g, double scale, int yOffset) {
+            int x = (int) (lastExpandedMbr.getLeftTop().getX() * scale) + PADDING;
+            int y = yOffset - (int) (lastExpandedMbr.getRightBottom().getY() * scale);
+            int w = (int) ((lastExpandedMbr.getRightBottom().getX() - lastExpandedMbr.getLeftTop().getX()) * scale);
+            int h = (int) ((lastExpandedMbr.getRightBottom().getY() - lastExpandedMbr.getLeftTop().getY()) * scale);
+
+            g.setColor(new Color(255, 200, 0));
+            g.setStroke(new BasicStroke(3));
+            g.drawRect(x, y, w, h);
+            g.setStroke(new BasicStroke(1));
+        }
+
+        /**
+         * 모든 점 그리기 메서드.
+         * 트리에 저장된 모든 포인트를 화면에 점으로 그림.
+         */
+        private void drawAllPoints(Graphics2D g, Node node, double scale, int yOffset) {
+            if (node == null) return;
+
+            if (node.leaf && node.points != null) {
+                for (Point p : node.points) {
+                    int px = (int) (p.getX() * scale) + PADDING;
+                    int py = yOffset - (int) (p.getY() * scale);
+                    g.setColor(Color.BLACK);
+                    g.fillOval(px - 2, py - 2, 4, 4);
+                }
+            } else if (node.children != null) {
+                for (Node child : node.children) {
+                    drawAllPoints(g, child, scale, yOffset);
+                }
+            }
+        }
+
+        /**
+         * 강조 점 그리기 메서드.
+         * 검색 결과나 KNN 결과로 선택된 점들을 강조하여 그림.
+         */
+        private void drawHighlightedPoints(Graphics2D g, double scale, int yOffset) {
+            List<Point> points = new ArrayList<>(highlightedPoints);
+            g.setFont(new Font("SansSerif", Font.BOLD, 11));
+
+            if (currentSearchRect != null) {
+                for (Point p : points) {
+                    int x = (int) (p.getX() * scale) + PADDING;
+                    int y = yOffset - (int) (p.getY() * scale);
+                    g.setColor(new Color(255, 0, 0));
+                    g.fillOval(x - 5, y - 5, 10, 10);
+                    g.setColor(Color.BLACK);
+                    g.setStroke(new BasicStroke(2));
+                    g.drawOval(x - 5, y - 5, 10, 10);
+                    g.setStroke(new BasicStroke(1));
+                }
+            }
+            else if (currentKnnSource != null) {
+                int idx = 1;
+                for (Point p : points) {
+                    int x = (int) (p.getX() * scale) + PADDING;
+                    int y = yOffset - (int) (p.getY() * scale);
+
+                    g.setColor(new Color(0, 100, 255));
+                    g.fillOval(x - 7, y - 7, 14, 14);
+                    g.setColor(Color.WHITE);
+                    g.setFont(new Font("SansSerif", Font.BOLD, 12));
+                    String label = String.valueOf(idx++);
+                    int labelWidth = g.getFontMetrics().stringWidth(label);
+                    g.drawString(label, x - labelWidth/2, y + 4);
+
+                    Double dist = knnResultDistances.get(p);
+                    if (dist != null) {
+                        g.setColor(Color.BLACK);
+                        g.setFont(new Font("SansSerif", Font.PLAIN, 10));
+                        g.drawString(String.format("%.2f", dist), x + 10, y + 15);
+                    }
+                }
+            }
+        }
+
+        /**
+         * 신규 점 그리기 메서드.
+         * 방금 삽입된 점을 강조 효과와 함께 그림.
+         */
+        private void drawNewPoint(Graphics2D g, double scale, int yOffset) {
+            int x = (int) (lastInsertedPoint.getX() * scale) + PADDING;
+            int y = yOffset - (int) (lastInsertedPoint.getY() * scale);
+
+            g.setColor(new Color(0, 255, 0, 100));
+            g.fillOval(x - 12, y - 12, 24, 24);
+            g.setColor(new Color(0, 255, 0));
+            g.fillOval(x - 5, y - 5, 10, 10);
+            g.setColor(Color.BLACK);
+            g.setStroke(new BasicStroke(2));
+            g.drawOval(x - 5, y - 5, 10, 10);
+            g.setStroke(new BasicStroke(1));
+        }
+
+        /**
+         * 삭제 점 그리기 메서드.
+         * 삭제 중인 점을 빨간 X표시로 그림.
+         */
+        private void drawDeletingPoint(Graphics2D g, double scale, int yOffset) {
+            int x = (int) (deletingPoint.getX() * scale) + PADDING;
+            int y = yOffset - (int) (deletingPoint.getY() * scale);
+
+            g.setColor(new Color(255, 0, 0));
+            g.setStroke(new BasicStroke(3));
+            g.drawLine(x - 7, y - 7, x + 7, y + 7);
+            g.drawLine(x + 7, y - 7, x - 7, y + 7);
+            g.setStroke(new BasicStroke(1));
+        }
     }
 
-    // DistSpat 내부 클래스. KNN 검색 시 우선순위 큐(PQ)에 거리와 객체를 함께 저장.
+    /**
+     * 거리-객체 쌍 클래스.
+     * KNN 탐색 시 우선순위 큐에서 거리와 객체(Node 또는 Point)를 함께 관리함.
+     */
     private class DistSpat implements Comparable<DistSpat> {
         final double dist;
         final Object item;
@@ -222,7 +711,10 @@ public class RTreeImpl implements RTree {
         @Override public int compareTo(DistSpat other) { return Double.compare(this.dist, other.dist); }
     }
 
-    // RTreeImpl 생성자. Assignment45가 new RTreeImpl()을 호출할 때 GUI 창을 생성.
+    /**
+     * RTreeImpl 생성자.
+     * GUI 창을 초기화하고 화면에 띄움.
+     */
     public RTreeImpl() {
         this.root = new Node(true, null);
         this.size = 0;
@@ -237,7 +729,10 @@ public class RTreeImpl implements RTree {
         });
     }
 
-    // updateGUI 헬퍼 메서드. GUI를 갱신할 때 스레드 문제를 해결(EDT에서 실행).
+    /**
+     * GUI 갱신 메서드.
+     * EDT(Event Dispatch Thread)에서 repaint()를 호출하여 화면을 다시 그림.
+     */
     private void updateGUI() {
         if (this.guiPanel != null) {
             SwingUtilities.invokeLater(() -> {
@@ -246,105 +741,264 @@ public class RTreeImpl implements RTree {
         }
     }
 
-    // add 메서드. 포인트를 삽입하고, Thread.sleep으로 애니메이션 효과를 줌.
+    /**
+     * 점 삽입 메서드.
+     * 점을 입력받아 적절한 리프 노드를 찾고 삽입하며, 필요 시 노드를 분할하고 GUI를 갱신함.
+     */
     @Override
     public void add(Point point) {
         this.currentSearchRect = null;
         this.currentKnnSource = null;
         this.highlightedPoints.clear();
+        this.prunedNodes.clear();
+        this.knnVisitedNodes.clear();
+        this.splitGroup1 = null;
+        this.splitGroup2 = null;
+        this.deletingPoint = null;
+        this.shrinkingMbr = null;
+
         if (findLeaf(root, point) != null) {
             return;
         }
+
         Node leaf = chooseLeaf(root, point);
+
+        if (leaf.hasValidMbr()) {
+            this.lastExpandedMbr = new Rectangle(leaf.mbr.getLeftTop(), leaf.mbr.getRightBottom());
+        }
+
+        this.lastInsertedPoint = point;
+
         insert(leaf, point);
         this.size++;
         updateGUI();
 
-        // Thread.sleep() 호출. InterruptedException 예외 처리가 필요.
         try {
-            Thread.sleep(3000);
+            Thread.sleep(1500);
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
+
+        this.lastInsertedPoint = null;
+        this.lastExpandedMbr = null;
+        this.splitGroup1 = null;
+        this.splitGroup2 = null;
+        updateGUI();
     }
 
-    // search 메서드. 범위 검색을 수행하고, Task 1 완료를 JOptionPane으로 알림.
+    /**
+     * 범위 검색 메서드.
+     * 지정된 사각형 영역 내의 점들을 탐색하여 반환함. Task 완료 알림을 포함.
+     */
     @Override
     public Iterator<Point> search(Rectangle rectangle) {
+        JOptionPane.showMessageDialog(guiFrame,
+                "Task 1 complete\n\nPress OK to start Range Search...",
+                "Task 1 Complete", JOptionPane.INFORMATION_MESSAGE);
+
         this.currentSearchRect = null;
         this.currentKnnSource = null;
         this.highlightedPoints.clear();
-        updateGUI();
-
-        // JOptionPane 호출. Assignment45의 main 스레드를 여기서 일시정지시킴.
-        JOptionPane.showMessageDialog(guiFrame,
-                "Task 1 complete\n",
-                "Task 1 complete", JOptionPane.INFORMATION_MESSAGE);
+        this.prunedNodes.clear();
+        this.knnVisitedNodes.clear();
+        this.knnCandidatePoints.clear();
+        this.lastInsertedPoint = null;
+        this.lastExpandedMbr = null;
+        this.splitGroup1 = null;
+        this.splitGroup2 = null;
 
         List<Point> result = new ArrayList<>();
         this.currentSearchRect = rectangle;
         this.highlightedPoints.clear();
-        searchRecursive(root, rectangle, result);
+        this.prunedNodes.clear();
+
+        updateGUI();
+        try { Thread.sleep(800); } catch (InterruptedException e) {}
+
+        searchRecursiveWithPruning(root, rectangle, result);
+
         this.highlightedPoints.addAll(result);
         updateGUI();
+        try { Thread.sleep(1000); } catch (InterruptedException e) {}
+
+        JOptionPane.showMessageDialog(guiFrame,
+                "Task 2 complete\n\nFound " + result.size() + " points\n\nPress OK to continue...",
+                "Task 2 Complete", JOptionPane.INFORMATION_MESSAGE);
 
         return result.iterator();
     }
 
-    // nearest 메서드. KNN 검색을 수행하고, Task 2 완료를 JOptionPane으로 알림.
+    /**
+     * 재귀 검색 헬퍼 메서드.
+     * 노드의 MBR이 검색 영역과 겹치는지 확인하여 가지치기(Pruning)를 수행하며 탐색함.
+     */
+    private void searchRecursiveWithPruning(Node node, Rectangle rectangle, List<Point> result) {
+        if (node.leaf) {
+            for (Point p : node.points) {
+                if (rectContains(rectangle, p)) {
+                    result.add(p);
+                    this.highlightedPoints.clear();
+                    this.highlightedPoints.addAll(result);
+                    updateGUI();
+                    try { Thread.sleep(400); } catch (InterruptedException e) {}
+                }
+            }
+        } else {
+            for (Node child : node.children) {
+                if (rectIntersects(child.getMbr(), rectangle)) {
+                    searchRecursiveWithPruning(child, rectangle, result);
+                } else {
+                    prunedNodes.add(child);
+                    collectAllDescendants(child, prunedNodes);
+                    updateGUI();
+                    try { Thread.sleep(500); } catch (InterruptedException e) {}
+                }
+            }
+        }
+    }
+
+    /**
+     * 자손 노드 수집 헬퍼 메서드.
+     * 가지치기된 노드의 시각화를 위해 모든 하위 노드를 수집함.
+     */
+    private void collectAllDescendants(Node node, List<Node> list) {
+        if (!node.leaf && node.children != null) {
+            for (Node child : node.children) {
+                list.add(child);
+                collectAllDescendants(child, list);
+            }
+        }
+    }
+
+    /**
+     * KNN 검색 메서드.
+     * 주어진 점(source)에서 가장 가까운 k개의 점을 탐색하여 반환함. 우선순위 큐를 사용한 Best-First 탐색 수행.
+     */
     @Override
     public Iterator<Point> nearest(Point source, int maxCount) {
-        updateGUI();
-
         JOptionPane.showMessageDialog(guiFrame,
-                "Task 2 complete\n",
-                "Task 2 완료", JOptionPane.INFORMATION_MESSAGE);
+                "Task 2 complete\n\nPress OK to start KNN search...",
+                "Task 2 Complete", JOptionPane.INFORMATION_MESSAGE);
+
+        this.currentSearchRect = null;
+        this.prunedNodes.clear();
+        this.knnVisitedNodes.clear();
+        this.knnVisitOrder.clear();
+        this.knnCandidatePoints.clear();
+        this.knnResultDistances.clear();
+        this.knnNewlyFoundPoint = null;
+        this.knnCurrentNode = null;
+        this.highlightedPoints.clear();
+        this.lastInsertedPoint = null;
+        this.lastExpandedMbr = null;
+        this.splitGroup1 = null;
+        this.splitGroup2 = null;
+        this.knnCurrentBestDist = Double.POSITIVE_INFINITY;
+        this.currentKnnSource = source;
 
         PriorityQueue<DistSpat> pq = new PriorityQueue<>();
         pq.add(new DistSpat(root, 0.0));
         List<Point> result = new ArrayList<>();
-        this.currentSearchRect = null;
-        this.currentKnnSource = source;
-        this.highlightedPoints.clear();
+        int visitOrder = 1;
 
         while (!pq.isEmpty() && result.size() < maxCount) {
             DistSpat current = pq.poll();
+
             if (current.item instanceof Point) {
-                result.add((Point) current.item);
+                Point p = (Point) current.item;
+                result.add(p);
+                double dist = source.distance(p);
+
+                this.knnNewlyFoundPoint = p;
+                this.knnCandidatePoints.remove(p);
+                updateGUI();
+                try { Thread.sleep(1000); } catch (InterruptedException e) {}
+
+                this.knnCurrentBestDist = dist;
+                this.knnResultDistances.put(p, dist);
+                this.knnNewlyFoundPoint = null;
+
+                this.highlightedPoints.clear();
+                this.highlightedPoints.addAll(result);
+                updateGUI();
+                try { Thread.sleep(800); } catch (InterruptedException e) {}
+
             } else {
                 Node node = (Node) current.item;
+                this.knnCurrentNode = node;
+                knnVisitedNodes.add(node);
+                knnVisitOrder.put(node, visitOrder++);
+                updateGUI();
+                try { Thread.sleep(700); } catch (InterruptedException e) {}
+
                 if (node.leaf) {
                     for (Point p : node.points) {
+                        this.knnCandidatePoints.add(p);
                         pq.add(new DistSpat(p, rectMinDistance(new Rectangle(p,p), source)));
                     }
+                    updateGUI();
+                    try { Thread.sleep(600); } catch (InterruptedException e) {}
                 } else {
                     for (Node child : node.children) {
                         if (child.hasValidMbr()) {
-                            pq.add(new DistSpat(child, rectMinDistance(child.getMbr(), source)));
+                            double minDist = rectMinDistance(child.getMbr(), source);
+                            if (result.size() == maxCount && minDist > knnCurrentBestDist) {
+                                prunedNodes.add(child);
+                                collectAllDescendants(child, prunedNodes);
+                                updateGUI();
+                                try { Thread.sleep(500); } catch (InterruptedException e) {}
+                            } else {
+                                pq.add(new DistSpat(child, minDist));
+                            }
                         }
                     }
                 }
+
+                this.knnCurrentNode = null;
             }
         }
+
+        this.knnVisitedNodes.clear();
+        this.knnVisitOrder.clear();
+        this.knnCandidatePoints.clear();
+        this.prunedNodes.clear();
+        this.highlightedPoints.clear();
         this.highlightedPoints.addAll(result);
         updateGUI();
+        try { Thread.sleep(1000); } catch (InterruptedException e) {}
+
+        JOptionPane.showMessageDialog(guiFrame,
+                "Task 3 complete\n\nFound " + result.size() + " nearest points\n\nPress OK to continue...",
+                "Task 3 Complete", JOptionPane.INFORMATION_MESSAGE);
 
         return result.iterator();
     }
 
-    // delete 메서드. 포인트를 삭제하고, 첫 호출 시 Task 3 완료를 알림.
+    /**
+     * 점 삭제 메서드.
+     * 지정된 점을 찾아 트리에서 제거하고, 언더플로우 발생 시 트리를 재조정(Condense)함.
+     */
     @Override
     public void delete(Point point) {
         if (firstDeleteCall) {
             firstDeleteCall = false;
-            updateGUI();
+
             JOptionPane.showMessageDialog(guiFrame,
-                    "Task 3 complete\n",
-                    "Task 3 complete", JOptionPane.INFORMATION_MESSAGE);
+                    "Task 3 complete\n\nPress OK to start deletion...",
+                    "Task 3 Complete", JOptionPane.INFORMATION_MESSAGE);
 
             this.currentSearchRect = null;
             this.currentKnnSource = null;
             this.highlightedPoints.clear();
+            this.prunedNodes.clear();
+            this.knnVisitedNodes.clear();
+            this.knnVisitOrder.clear();
+            this.knnCandidatePoints.clear();
+            this.lastInsertedPoint = null;
+            this.lastExpandedMbr = null;
+            this.splitGroup1 = null;
+            this.splitGroup2 = null;
+            updateGUI();
         }
 
         Node leaf = findLeaf(root, point);
@@ -362,39 +1016,56 @@ public class RTreeImpl implements RTree {
             return;
         }
 
+        this.deletingPoint = point;
+        this.deletingLeafNode = leaf;
+        updateGUI();
+        try { Thread.sleep(600); } catch (InterruptedException e) {}
+
+        this.oldMbrBeforeDelete = new Rectangle(leaf.mbr.getLeftTop(), leaf.mbr.getRightBottom());
+
         leaf.points.remove(toRemove);
         leaf.recalcMbr();
+
+        if (leaf.hasValidMbr()) {
+            this.shrinkingMbr = new Rectangle(leaf.mbr.getLeftTop(), leaf.mbr.getRightBottom());
+        }
+        this.deletingPoint = null;
+        updateGUI();
+        try { Thread.sleep(700); } catch (InterruptedException e) {}
+
         condenseTree(leaf);
         this.size--;
 
         if (size == 0) {
             root = new Node(true, null);
         }
-        updateGUI();
 
-        // Thread.sleep() 호출. 삭제 과정 애니메이션을 위해 1.5초 대기.
-        try {
-            Thread.sleep(3000);
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
+        this.deletingLeafNode = null;
+        this.shrinkingMbr = null;
+        this.oldMbrBeforeDelete = null;
+        updateGUI();
     }
 
-    // isEmpty 메서드. 모든 Task 완료 후 최종 결과를 JOptionPane으로 알림.
+    /**
+     * 트리 비움 확인 메서드.
+     * 트리에 저장된 점이 없는지 여부를 반환함.
+     */
     @Override
     public boolean isEmpty() {
         updateGUI();
         boolean result = (this.size == 0);
 
         JOptionPane.showMessageDialog(guiFrame,
-                "Task 4 complete" +
-                        "최종 결과: isEmpty() = " + result,
+                "Task 4 complete" ,
                 "Task 4 complete", JOptionPane.INFORMATION_MESSAGE);
 
         return result;
     }
 
-    // chooseLeaf 메서드. 면적 증가(enlargement)가 가장 적은 하위 노드를 선택.
+    /**
+     * 리프 노드 선택 메서드.
+     * 점을 삽입할 때 면적 증가량이 가장 적은 리프 노드를 선택하여 반환함.
+     */
     private Node chooseLeaf(Node node, Point point) {
         if (node.leaf) {
             return node;
@@ -420,7 +1091,10 @@ public class RTreeImpl implements RTree {
         return chooseLeaf(bestChild, point);
     }
 
-    // insert 메서드. 리프에 삽입 후, 오버플로우 시 splitNode를 호출.
+    /**
+     * 삽입 실행 메서드.
+     * 리프 노드에 점을 추가하고, 오버플로우 발생 시 노드를 분할(Split)함.
+     */
     private void insert(Node leaf, Point point) {
         leaf.points.add(point);
         leaf.recalcMbr();
@@ -432,7 +1106,10 @@ public class RTreeImpl implements RTree {
         }
     }
 
-    // splitNode 메서드. Quadratic Split(2차 분할) 알고리즘을 구현.
+    /**
+     * 노드 분할 메서드.
+     * Quadratic Split 알고리즘을 사용하여 노드를 두 개의 그룹으로 분할함.
+     */
     private Node[] splitNode(Node node) {
         List entries;
         if (node.leaf) {
@@ -458,32 +1135,42 @@ public class RTreeImpl implements RTree {
             ((Node)seed2).parent = group2;
         }
 
+        group1.recalcMbr();
+        group2.recalcMbr();
+
         entries.remove(seed1);
         entries.remove(seed2);
 
         while (!entries.isEmpty()) {
-            // m=2 (최소 엔트리) 보장 로직.
             if (group1.leaf) {
                 if (group1.points.size() + entries.size() == MIN_ENTRIES) {
-                    group1.points.addAll(entries);
+                    for (Object e : new ArrayList<>(entries)) {
+                        group1.points.add((Point) e);
+                    }
                     entries.clear();
                     break;
                 }
                 if (group2.points.size() + entries.size() == MIN_ENTRIES) {
-                    group2.points.addAll(entries);
+                    for (Object e : new ArrayList<>(entries)) {
+                        group2.points.add((Point) e);
+                    }
                     entries.clear();
                     break;
                 }
             } else {
                 if (group1.children.size() + entries.size() == MIN_ENTRIES) {
-                    group1.children.addAll(entries);
-                    entries.forEach(e -> ((Node)e).parent = group1);
+                    for (Object e : new ArrayList<>(entries)) {
+                        group1.children.add((Node) e);
+                        ((Node)e).parent = group1;
+                    }
                     entries.clear();
                     break;
                 }
                 if (group2.children.size() + entries.size() == MIN_ENTRIES) {
-                    group2.children.addAll(entries);
-                    entries.forEach(e -> ((Node)e).parent = group2);
+                    for (Object e : new ArrayList<>(entries)) {
+                        group2.children.add((Node) e);
+                        ((Node)e).parent = group2;
+                    }
                     entries.clear();
                     break;
                 }
@@ -529,10 +1216,19 @@ public class RTreeImpl implements RTree {
         }
         group1.recalcMbr();
         group2.recalcMbr();
+
+        this.splitGroup1 = group1;
+        this.splitGroup2 = group2;
+        updateGUI();
+        try { Thread.sleep(1000); } catch (InterruptedException e) {}
+
         return new Node[] { group1, group2 };
     }
 
-    // pickSeeds 헬퍼 메서드. Quadratic Split의 첫 단계로, 가장 낭비되는 공간이 큰 두 시드를 고름.
+    /**
+     * 시드 선택 헬퍼 메서드.
+     * 분할 시 가장 비효율적인(낭비 면적이 큰) 두 엔트리를 초기 시드로 선택함.
+     */
     private Object[] pickSeeds(List entries, Node node) {
         Object seed1 = null;
         Object seed2 = null;
@@ -558,7 +1254,10 @@ public class RTreeImpl implements RTree {
         return new Object[] { seed1, seed2 };
     }
 
-    // pickNext 헬퍼 메서드. Quadratic Split의 두 번째 단계로, 그룹 선호도 차이가 가장 큰 엔트리를 고름.
+    /**
+     * 다음 엔트리 선택 헬퍼 메서드.
+     * 두 그룹 간의 면적 증가량 차이가 가장 큰 엔트리를 선택함.
+     */
     private Object pickNext(List entries, Node group1, Node group2, Node node) {
         Object nextEntry = null;
         double maxDiff = Double.NEGATIVE_INFINITY;
@@ -579,7 +1278,10 @@ public class RTreeImpl implements RTree {
         return nextEntry;
     }
 
-    // adjustTree 메서드. 삽입/분할 후 트리를 재조정. (루트 MBR 버그 수정된 버전)
+    /**
+     * 트리 조정 메서드.
+     * 삽입 또는 분할 후 부모 노드로 거슬러 올라가며 MBR을 갱신하고 분할을 전파함.
+     */
     private void adjustTree(Node node, Node newNode) {
         Node n = node;
         Node nn = newNode;
@@ -587,7 +1289,6 @@ public class RTreeImpl implements RTree {
             Node parent = n.parent;
             if (parent == null) break;
 
-            // 핵심 로직. 자식(nn)을 먼저 추가하고, MBR을 재계산해야 .
             if (nn != null) {
                 parent.children.add(nn);
                 nn.parent = parent;
@@ -604,7 +1305,6 @@ public class RTreeImpl implements RTree {
             }
         }
 
-        // 루트 분할 처리 로직.
         if (nn != null) {
             Node newRoot = new Node(false, null);
             newRoot.children.add(n);
@@ -613,10 +1313,15 @@ public class RTreeImpl implements RTree {
             nn.parent = newRoot;
             newRoot.recalcMbr();
             this.root = newRoot;
+        } else {
+            root.recalcMbr();
         }
     }
 
-    // searchRecursive 헬퍼 메서드. MBR이 겹치는지(intersects) 확인하여 가지치기(Pruning)를 수행.
+    /**
+     * 재귀 검색 헬퍼 메서드 (미사용).
+     * 단순 포함 여부 확인을 통한 검색 (searchRecursiveWithPruning이 대신 사용됨).
+     */
     private void searchRecursive(Node node, Rectangle rectangle, List<Point> result) {
         if (node.leaf) {
             for (Point p : node.points) {
@@ -633,7 +1338,10 @@ public class RTreeImpl implements RTree {
         }
     }
 
-    // findLeaf 헬퍼 메서드. 삭제할 포인트가 어느 리프에 있는지 찾음.
+    /**
+     * 리프 검색 메서드.
+     * 특정 점을 포함하고 있는 리프 노드를 찾아 반환함.
+     */
     private Node findLeaf(Node node, Point point) {
         if (node.leaf) {
             for (Point p : node.points) {
@@ -654,7 +1362,10 @@ public class RTreeImpl implements RTree {
         return null;
     }
 
-    // condenseTree 메서드. 삭제 후 트리를 압축(언더플로우 처리, MBR 축소).
+    /**
+     * 트리 압축 메서드.
+     * 삭제 후 언더플로우가 발생한 노드들을 처리하고 MBR을 갱신하며 루트까지 올라감.
+     */
     private void condenseTree(Node node) {
         Node n = node;
         while (n != root) {
@@ -668,7 +1379,6 @@ public class RTreeImpl implements RTree {
             }
             if(parent == null) break;
 
-            // handleUnderflow에서 n이 제거됐는지 확인 후 부모로 이동.
             if(parent.children.contains(n)) {
                 n = parent;
             } else {
@@ -676,7 +1386,6 @@ public class RTreeImpl implements RTree {
             }
         }
 
-        // 루트 높이 축소 로직.
         if (!root.leaf && root.children.size() == 1) {
             Node oldRoot = root;
             root = root.children.get(0);
@@ -685,7 +1394,10 @@ public class RTreeImpl implements RTree {
         }
     }
 
-    // handleUnderflow 헬퍼 메서드. m=2개 미만인 노드를 형제와 병합(Merge).
+    /**
+     * 언더플로우 처리 메서드.
+     * 엔트리 수가 부족한 노드를 형제 노드와 병합하거나 재분배함.
+     */
     private void handleUnderflow(Node node) {
         Node parent = node.parent;
         if (parent == null) return;
@@ -700,7 +1412,6 @@ public class RTreeImpl implements RTree {
             return;
         }
 
-        // (재분배(Re-distribution)는 생략하고 병합(Merge)만 구현)
         if (node.leaf) {
             if (sibling.points.size() + node.points.size() <= MAX_ENTRIES) {
                 sibling.points.addAll(node.points);
@@ -708,7 +1419,12 @@ public class RTreeImpl implements RTree {
                 node.points.clear();
                 sibling.recalcMbr();
             } else {
+                while (node.points.size() < MIN_ENTRIES && sibling.points.size() > MIN_ENTRIES) {
+                    Point borrow = sibling.points.remove(sibling.points.size() - 1);
+                    node.points.add(0, borrow);
+                }
                 node.recalcMbr();
+                sibling.recalcMbr();
             }
         } else {
             if (sibling.children.size() + node.children.size() <= MAX_ENTRIES) {
@@ -720,23 +1436,31 @@ public class RTreeImpl implements RTree {
                 node.children.clear();
                 sibling.recalcMbr();
             } else {
+                while (node.children.size() < MIN_ENTRIES && sibling.children.size() > MIN_ENTRIES) {
+                    Node borrow = sibling.children.remove(sibling.children.size() - 1);
+                    borrow.parent = node;
+                    node.children.add(0, borrow);
+                }
                 node.recalcMbr();
+                sibling.recalcMbr();
             }
         }
     }
 
-    // -----------------------------------------------------------------
-    // 5. Rectangle 헬퍼 메서드
-    // -----------------------------------------------------------------
-
-    // createInvalidMbr 헬퍼 메서드. 비어있는 MBR을 정의.
+    /**
+     * 무효 MBR 생성 메서드.
+     * 초기화나 빈 상태를 나타내는 무효한(무한대 좌표) 사각형을 생성함.
+     */
     private Rectangle createInvalidMbr() {
         return new Rectangle(
                 new Point(Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY),
                 new Point(Double.NEGATIVE_INFINITY, Double.NEGATIVE_INFINITY));
     }
 
-    // rectArea 헬퍼 메서드. 사각형의 면적을 계산.
+    /**
+     * 면적 계산 메서드.
+     * 사각형의 너비와 높이를 곱하여 면적을 반환함.
+     */
     private double rectArea(Rectangle r) {
         if (r.getLeftTop().getX() == Double.POSITIVE_INFINITY) {
             return 0;
@@ -746,7 +1470,10 @@ public class RTreeImpl implements RTree {
         return width * height;
     }
 
-    // rectContains 헬퍼 메서드. 사각형이 점을 포하는지 확인.
+    /**
+     * 포함 여부 확인 메서드.
+     * 사각형이 특정 점을 내부에 포함하는지 여부를 반환함.
+     */
     private boolean rectContains(Rectangle r, Point p) {
         if (r == null || p == null || r.getLeftTop().getX() == Double.POSITIVE_INFINITY) {
             return false;
@@ -757,7 +1484,10 @@ public class RTreeImpl implements RTree {
                 p.getY() <= r.getRightBottom().getY();
     }
 
-    // rectIntersects 헬퍼 메서드. 두 사각형이 겹치는지 확인.
+    /**
+     * 교차 여부 확인 메서드.
+     * 두 사각형이 서로 겹치는지 여부를 반환함.
+     */
     private boolean rectIntersects(Rectangle r1, Rectangle r2) {
         if (r1 == null || r2 == null) return false;
         if (r1.getLeftTop().getX() == Double.POSITIVE_INFINITY ||
@@ -770,7 +1500,10 @@ public class RTreeImpl implements RTree {
                 r2.getLeftTop().getY() > r1.getRightBottom().getY());
     }
 
-    // rectEnlargement 헬퍼 메서드. 점을 포할 때 면적 증가량을 계산.
+    /**
+     * 면적 증가량 계산 메서드.
+     * 점을 포함하기 위해 확장했을 때 늘어나는 면적의 양을 반환함.
+     */
     private double rectEnlargement(Rectangle r, Point p) {
         if (p == null) return 0;
         if (r.getLeftTop().getX() == Double.POSITIVE_INFINITY) {
@@ -784,7 +1517,10 @@ public class RTreeImpl implements RTree {
         return newArea - rectArea(r);
     }
 
-    // rectEnlargement 헬퍼 메서드 오버로딩. 사각형을 포할 때 면적 증가량을 계산.
+    /**
+     * 면적 증가량 계산 메서드 (Overloaded).
+     * 다른 사각형을 포함하기 위해 확장했을 때 늘어나는 면적의 양을 반환함.
+     */
     private double rectEnlargement(Rectangle r1, Rectangle r2) {
         if (r2 == null || r2.getLeftTop().getX() == Double.POSITIVE_INFINITY) {
             return 0;
@@ -800,7 +1536,10 @@ public class RTreeImpl implements RTree {
         return newArea - rectArea(r1);
     }
 
-    // rectMerge 헬퍼 메서드. 두 사각형을 병합(merge)하여 새 MBR을 반환.
+    /**
+     * 병합 메서드.
+     * 두 사각형을 모두 포함하는 최소 경계 사각형(MBR)을 생성하여 반환함.
+     */
     private Rectangle rectMerge(Rectangle r1, Rectangle r2) {
         if (r1.getLeftTop().getX() == Double.POSITIVE_INFINITY &&
                 r2.getLeftTop().getX() == Double.POSITIVE_INFINITY) {
@@ -819,7 +1558,10 @@ public class RTreeImpl implements RTree {
         return new Rectangle(new Point(newMinX, newMinY), new Point(newMaxX, newMaxY));
     }
 
-    // rectMinDistance 헬퍼 메서드. 사각형과 점 사이의 최소 거리(MINDIST)를 계산.
+    /**
+     * 최소 거리 계산 메서드.
+     * 사각형과 점 사이의 최단 유클리드 거리를 반환함 (MINDIST).
+     */
     private double rectMinDistance(Rectangle r, Point p) {
         if (r.getLeftTop().getX() == Double.POSITIVE_INFINITY) {
             return Double.POSITIVE_INFINITY;
